@@ -8,6 +8,9 @@ from awsglue.gluetypes import *
 from awsgluedq.transforms import EvaluateDataQuality
 from awsglue import DynamicFrame
 
+from functools import reduce
+from pyspark.sql import functions as F
+
 def sparkSqlQuery(glueContext, query, mapping, transformation_ctx) -> DynamicFrame:
     for alias, frame in mapping.items():
         frame.toDF().createOrReplaceTempView(alias)
@@ -61,19 +64,99 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 # Default ruleset used by all target nodes with data quality enabled
-DEFAULT_DATA_QUALITY_RULESET = """
-    Rules = [
-        ColumnCount > 0
-    ]
-"""
+DEFAULT_DATA_QUALITY_RULESET = """Rules = [
+    ColumnCount > 0,
+
+    IsComplete "rating",
+    IsComplete "rating_count",
+    IsComplete "discounted_price",
+    IsComplete "actual_price",
+
+    ColumnValues "rating" >= 0,
+    ColumnValues "rating_count" >= 0,
+    ColumnValues "discounted_price" >= 0,
+    ColumnValues "actual_price" >= 0,
+    ColumnValues "discount_percentage" >= 0
+]"""
+
+# -------- DELIMITER CORRUPTION CHECK -------- #
+import csv
+import io
+
+raw_lines = spark.read.text(f"s3://{source_bucket}/{source_key}").collect()
+
+if len(raw_lines) < 2:
+    raise Exception("Glue Visual ETL | Corrupted CSV detected (file has no data rows)")
+
+def count_csv_columns(line: str) -> int:
+    """Count columns correctly, respecting quoted fields containing commas."""
+    try:
+        return len(next(csv.reader(io.StringIO(line))))
+    except StopIteration:
+        return 0
+
+header_line = raw_lines[0][0]
+expected_col_count = count_csv_columns(header_line)
+
+bad_row_indices = []
+for i, row in enumerate(raw_lines[1:], start=2):
+    line = row[0]
+    actual_col_count = count_csv_columns(line)
+    if actual_col_count != expected_col_count:
+        bad_row_indices.append((i, actual_col_count, line[:80]))
+
+if bad_row_indices:
+    details = "\n".join(
+        [f"  Line {idx}: expected {expected_col_count} cols, got {actual} → {preview}..."
+         for idx, actual, preview in bad_row_indices]
+    )
+    raise Exception(
+        f"Glue Visual ETL | Corrupted CSV detected — {len(bad_row_indices)} row(s) have wrong column count "
+        f"(likely semicolons used as delimiters instead of commas):\n{details}"
+    )
+
+print(f"Glue Visual ETL | Column count validation passed: all rows have {expected_col_count} columns")
+# -------- DELIMITER CORRUPTION CHECK -------- #
 
 # Script generated for node Raw data source S3
-RawdatasourceS3_node1772431168408 = glueContext.create_dynamic_frame.from_options(format_options={"quoteChar": "\"", "withHeader": True, "separator": ",", "optimizePerformance": False}, connection_type="s3", format="csv", 
+RawdatasourceS3_node1772431168408 = glueContext.create_dynamic_frame.from_options(format_options={"quoteChar": "\"", "withHeader": True, "separator": ",", "mode": "PERMISSIVE", "optimizePerformance": False}, connection_type="s3", format="csv", 
     # connection_options={"paths": ["s3://aws-glue-s3-bucket-one/raw_data/sales_data/"], "recurse": True}, 
     connection_options={"paths": [f"s3://{source_bucket}/{source_key}"],"recurse": False},
     transformation_ctx="RawdatasourceS3_node1772431168408")
 # for debugging only
 print(f"Glue Visual ETL | Processing file: s3://{source_bucket}/{source_key}")
+
+df = RawdatasourceS3_node1772431168408.toDF()
+
+print("Glue Visual ETL | DEBUG bucket:", source_bucket)
+print("Glue Visual ETL | DEBUG key:", source_key)
+print("Glue Visual ETL | DEBUG columns:", df.columns)
+print("Glue Visual ETL | DEBUG row count:", df.count())
+print("Glue Visual ETL | DEBUG schema:", df.schema)
+print("Glue Visual ETL | DEBUG sample rows:", df.limit(2).toPandas())
+
+# -------- CORRUPTION CHECK (SAFE VERSION) -------- #
+
+# If Spark inferred no columns → corrupted file
+if len(df.columns) == 0:
+    raise Exception("Glue Visual ETL | Corrupted CSV detected (no columns inferred)")
+
+expected_cols = len(df.columns)
+
+# If dataframe empty → corrupted file
+if df.limit(1).count() == 0:
+    raise Exception("Glue Visual ETL | Corrupted CSV detected (empty dataframe)")
+
+# Row-level corruption detection
+null_exprs = [F.col(c).isNull().cast("int") for c in df.columns]
+
+bad_rows = df.filter(
+    reduce(lambda a, b: a + b, null_exprs) > expected_cols * 0.7
+)
+
+if bad_rows.limit(1).count() > 0:
+    raise Exception("Glue Visual ETL | Corrupted CSV detected (null-heavy rows)")
+# -------- CORRUPTION CHECK (SAFE VERSION) -------- #
 
 # Script generated for node SQL Query
 SqlQuery61 = '''
