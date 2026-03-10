@@ -76,7 +76,9 @@ DEFAULT_DATA_QUALITY_RULESET = """Rules = [
     ColumnValues "rating_count" >= 0,
     ColumnValues "discounted_price" >= 0,
     ColumnValues "actual_price" >= 0,
-    ColumnValues "discount_percentage" >= 0
+    ColumnValues "discount_percentage" >= 0,
+    
+    IsUnique "product_id"
 ]"""
 
 # -------- DELIMITER CORRUPTION CHECK -------- #
